@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Newt version bumped to 1.17.0.
 
+## [1.17.0] - 2026-09-16
+### Changed
+- Newt version bumped to 1.17.0.
+
 ## [1.12.3] - 2026-04-30
 ### Changed
 - Newt version bumped to 1.12.3
