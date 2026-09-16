@@ -1,6 +1,6 @@
 name: "Newt - Pangolin Tunnels"
 description: "Secure remote access with Pangolin tunnels."
-maintainer: Alex Moras <alex@codesix.net>
+maintainer: lextum <Lextum@users.noreply.github.com>
 url: https://docs.fossorial.io
 version: "1.17.0"
 slug: "newt"
