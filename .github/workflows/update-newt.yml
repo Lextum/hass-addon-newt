@@ -1,0 +1,189 @@
+name: "Update Newt"
+
+on:
+  schedule:
+    # Daily at 05:17 UTC (off the hour to avoid GitHub's cron rush).
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Newt version to pin (default: latest upstream release)"
+        required: false
+        type: string
+      force:
+        description: "Rebuild and re-release even if the version is unchanged"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-newt
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check for a new Newt release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      updated: ${{ steps.bump.outputs.updated }}
+      version: ${{ steps.bump.outputs.version }}
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v4
+
+      - name: Resolve the target Newt version
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            latest="${INPUT_VERSION}"
+          else
+            latest="$(gh release view --repo fosrl/newt --json tagName --jq .tagName)"
+          fi
+          latest="${latest#v}"
+          if [ -z "${latest}" ]; then
+            echo "::error::Could not determine the latest Newt release"
+            exit 1
+          fi
+          echo "Target Newt version: ${latest}"
+          echo "version=${latest}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the upstream release assets exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "${VERSION}" --repo fosrl/newt --json assets --jq '.assets[].name')"
+          for want in newt_linux_amd64 newt_linux_arm64; do
+            if ! grep -qx "${want}" <<< "${assets}"; then
+              echo "::error::Newt ${VERSION} has no ${want} asset; refusing to release"
+              exit 1
+            fi
+          done
+
+      - name: Bump the add-on to the new version
+        id: bump
+        env:
+          VERSION: ${{ steps.upstream.outputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          current="$(sed -n 's/^ARG NEWT_VERSION="\(.*\)"$/\1/p' newt/Dockerfile)"
+          echo "Current: ${current:-<none>} -> target: ${VERSION}"
+          if [ -z "${current}" ]; then
+            echo "::error::Could not read ARG NEWT_VERSION from newt/Dockerfile"
+            exit 1
+          fi
+          if [ "${current}" = "${VERSION}" ] && [ "${FORCE}" != "true" ]; then
+            echo "Already up to date."
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          python3 - "$VERSION" <<'PY'
+          import datetime, pathlib, re, sys
+
+          version = sys.argv[1]
+          today = datetime.date.today().isoformat()
+
+          dockerfile = pathlib.Path("newt/Dockerfile")
+          dockerfile.write_text(
+              re.sub(
+                  r'^ARG NEWT_VERSION=".*"$',
+                  f'ARG NEWT_VERSION="{version}"',
+                  dockerfile.read_text(),
+                  count=1,
+                  flags=re.M,
+              )
+          )
+
+          config = pathlib.Path("newt/config.yaml")
+          config.write_text(
+              re.sub(
+                  r'^version: ".*"$',
+                  f'version: "{version}"',
+                  config.read_text(),
+                  count=1,
+                  flags=re.M,
+              )
+          )
+
+          changelog = pathlib.Path("newt/CHANGELOG.md")
+          text = changelog.read_text()
+          entry = (
+              f"## [{version}] - {today}\n"
+              "### Changed\n"
+              f"- Newt version bumped to {version}.\n\n"
+          )
+          marker = text.find("## [")
+          changelog.write_text(text[:marker] + entry + text[marker:] if marker != -1 else text + "\n" + entry)
+          PY
+
+          git diff --stat
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit the bump
+        id: commit
+        if: steps.bump.outputs.updated == 'true'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet; then
+            echo "::notice::Nothing to commit (forced rebuild of ${VERSION})"
+          else
+            git commit -am "Bump Newt to ${VERSION}"
+            git push
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish
+    needs: check
+    if: needs.check.outputs.updated == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish.yml
+    with:
+      ref: ${{ needs.check.outputs.sha }}
+
+  release:
+    name: Release
+    needs: [check, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.check.outputs.version }}
+          SHA: ${{ needs.check.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            echo "::notice::Release ${VERSION} already exists, skipping"
+            exit 0
+          fi
+          gh release create "${VERSION}" \
+            --target "${SHA}" \
+            --title "${VERSION}" \
+            --notes "Updates the bundled [Newt](https://github.com/fosrl/newt) client to ${VERSION}.
+
+          Upstream release notes: https://github.com/fosrl/newt/releases/tag/${VERSION}"
